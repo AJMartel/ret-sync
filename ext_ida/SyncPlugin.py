@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2016, Alexandre Gazet.
+# Copyright (C) 2016-2017, Alexandre Gazet.
 #
 # Copyright (C) 2012-2015, Quarkslab.
 #
@@ -41,8 +41,12 @@ except:
 
 import idaapi
 import idautils
+import ida_graph
 from idaapi import PluginForm
 
+
+# Enable/disable logging JSON received in the IDA output window
+DEBUG_JSON = False
 
 if sys.platform == 'win32':
     PYTHON_BIN = 'python.exe'
@@ -62,7 +66,7 @@ if not os.path.exists(os.path.join(PYTHON_PATH, PYTHON_BIN)):
 
 
 site_packages = os.path.join(PYTHON_PATH, "lib", "site-packages")
-if not site_packages in sys.path:
+if site_packages not in sys.path:
     sys.path.insert(0, site_packages)
 
 try:
@@ -91,8 +95,11 @@ CONNECT_BROKER_MAX_ATTEMPT = 4
 COL_GREEN = 0x33ff00
 COL_DEEP_PURPLE = 0xff44dd
 COL_YLW = 0x23ffff
+COL_BLUE_NAVY = 0x000080
+COL_GRAY = 0x808080
 
 COL_CURLINE = COL_YLW
+#COL_CURLINE = COL_BLUE_NAVY # renders better with some themes
 COL_CBTRACE = COL_GREEN
 
 NETNODE_STORE = "$ SYNC_STORE"
@@ -168,7 +175,7 @@ class RequestHandler(object):
 
     # rebase address with respect to local image base
     def rebase(self, base, offset):
-        if base:
+        if base is not None:
             # check for non-compliant debugger client
             if base > offset:
                 print "[sync] unsafe addr"
@@ -313,6 +320,38 @@ class RequestHandler(object):
         self.append_cmt(ea, "0x%x (rebased from 0x%x)" % (addr, raddr))
         print ("[*] comment added at 0x%x" % ea)
 
+    # return current cursor in IDA Pro
+    def req_cursor(self, hash):
+        print("[*] request IDA Pro cursor position")
+        addr = idc.ScreenEA()
+        self.notice_broker("cmd", "\"cmd\":\"%s\"" % addr)
+        return
+
+    # patch memory at specified address using info from debugger
+    def req_patch(self, hash):
+        addr, value, length = hash['addr'], hash['value'], hash['len']
+        if length != 4 and length != 8:
+            print("[x] unsupported length: %d" % length)
+            return
+        if length == 4:
+            prev_value = Dword(addr)
+            if MakeDword(addr) != 1:
+                print("[x] MakeDword failed")
+            if PatchDword(addr, value) != 1:
+                print("[x] PatchDword failed")
+            if not idc.OpOff(addr, 0, 0):
+                print("[x] OpOff failed")
+        elif length == 8:
+            prev_value = Qword(addr)
+            if MakeQword(addr) != 1:
+                print("[x] MakeQword failed")
+            if PatchQword(addr, value) != 1:
+                print("[x] PatchQword failed")
+            if not idc.OpOff(addr, 0, 0):
+                print("[x] OpOff failed")
+
+        print ("[*] patched 0x%x = 0x%x (previous was 0x%x)" % (addr, value, prev_value))
+
     # return idb's symbol for a given address
     def req_rln(self, hash):
         raddr, rbase, offset, base = hash['raddr'], hash['rbase'], hash['offset'], hash['base']
@@ -352,6 +391,19 @@ class RequestHandler(object):
             print ("[*] resolved symbol: %s" % sym)
         else:
             print ("[*] could not resolve symbol for address 0x%x" % addr)
+
+    # return address for a given idb's symbol
+    def req_rrln(self, hash):
+        sym, rbase, offset, base = hash['sym'], hash['rbase'], hash['offset'], hash['base']
+
+        print("[*] %s -  0x%x - 0x%x - 0x%x" % (sym, rbase, offset, base))
+
+        addr = idc.LocByName(sym)
+        if addr:
+            self.notice_broker("cmd", "\"cmd\":\"%s\"" % addr)
+            print ("[*] resolved address: %s" % addr)
+        else:
+            print ("[*] could not resolve address for symbol %s" % sym)
 
     # add label request at addr
     def req_lbl(self, hash):
@@ -524,25 +576,40 @@ class RequestHandler(object):
             print "[sync] idb is disabled"
 
     # parse and execute request
+    # Note that sometimes we don't receive the whole request from the broker.py
+    # so parsing fails. One way for fixing this would be to fix broker.py to get
+    # everything until "\n" before proxying it but the way we do here is to read
+    # everything until "}" is received (end of json)
     def parse_exec(self, req):
+        if self.prev_req:
+            if self.prev_req != "":
+                if DEBUG_JSON:
+                    print "[+] JSON merge with request: \"%s\"" % req
+
+            req = self.prev_req + req
+            self.prev_req = ""
         if req == '':
             return
+        if DEBUG_JSON:
+            print("parse_exec -> " + str(req))
 
         if not (req[0:6] == '[sync]'):
             print "\[<] bad hdr %s" % repr(req)
             print '[-] Request dropped due to bad header'
             return
 
-        req = self.normalize(req, 6)
+        req_ = self.normalize(req, 6)
         try:
-            hash = json.loads(req)
+            hash = json.loads(req_)
         except:
-            print "[-] Sync failed to parse json\n %s" % req
-            print "------------------------------------"
+            if DEBUG_JSON:
+                print "[-] Sync failed to parse json\n '%s'. Caching for next req..." % req_
+                print "------------------------------------"
+            self.prev_req = req
             return
 
         type = hash['type']
-        if not type in self.req_handlers:
+        if type not in self.req_handlers:
             print ("[*] unknown request: %s" % type)
             return
 
@@ -555,7 +622,7 @@ class RequestHandler(object):
             if self.is_active:
                 req_handler(hash)
             else:
-                # otherwise, silently drop the request if idb is not enabled
+                print "[-] Drop the request because idb is not enabled"
                 return
 
         idaapi.refresh_idaview_anyway()
@@ -622,7 +689,7 @@ class RequestHandler(object):
                 print "bp %d: conditional bp not supported" % i
             else:
                 if ((btype in [idc.BPT_EXEC, idc.BPT_SOFT]) and
-                    ((flags & idc.BPT_ENABLED) != 0)):
+                   ((flags & idc.BPT_ENABLED) != 0)):
 
                     offset = ea - self.base
                     bp = self.dbg_dialect['hbp' if (btype == idc.BPT_EXEC) else 'bp']
@@ -645,7 +712,7 @@ class RequestHandler(object):
         self.notice_broker("cmd", "\"cmd\":\"%s\"" % cmd)
         print "[sync] translate address 0x%x" % ea
 
-    # send a go command (F5) to the debugger (via the broker and dispatcher)
+    # send a go command (Alt-F5) to the debugger (via the broker and dispatcher)
     def go_notice(self):
         if not self.is_active:
             print "[sync] idb isn't enabled, can't go"
@@ -719,7 +786,10 @@ class RequestHandler(object):
             'rcmt': self.req_rcmt,
             'fcmt': self.req_fcmt,
             'raddr': self.req_raddr,
+            'cursor': self.req_cursor,
+            'patch': self.req_patch,
             'rln': self.req_rln,
+            'rrln': self.req_rrln,
             'lbl': self.req_lbl,
             'bc': self.req_bc,
             'bps_get': self.req_bps_get,
@@ -727,6 +797,7 @@ class RequestHandler(object):
             'modcheck': self.req_modcheck,
             'dialect': self.req_set_dbg_dialect
         }
+        self.prev_req = ""  # used as a cache if json is not completely received
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +813,8 @@ class Broker(QtCore.QProcess):
     def cb_broker_on_state_change(self, new_state):
         states = ["Not running", "Starting", "Running"]
         print "[*] broker new state: ", states[new_state]
+        if states[new_state] == "Not running":
+            print "[*] Check dispatcher.py.err if you think this is an error"
 
     def cb_broker_on_out(self):
         # readAllStandardOutput() returns QByteArray
@@ -827,117 +900,14 @@ class DbgDirHlpr(object):
 class GraphManager():
 
     def __init__(self):
-        idaname = "ida64" if __EA64__ else "ida"
-        if sys.platform == "win32":
-            dll = ctypes.windll[idaname + ".wll"]
-        elif sys.platform == "linux2":
-            dll = ctypes.CDLL(None)
-        elif sys.platform == "darwin":
-            dll = ctypes.CDLL(None)
-
-        #-------
-
-        # ui_notification_t dispatcher
-        callui = ctypes.c_void_p.in_dll(dll, "callui")
-        print "    callui 0x%x" % callui.value
-
-        # graph_notification_t dispatcher
-        grentry = ctypes.c_void_p.in_dll(dll, "grentry")
-        print "    grentry 0x%x" % grentry.value
-
-        #-------
-
-        """
-        ui_get_current_tform,   // * get current tform (only gui version)
-                                // Parameters: none
-                                // Returns: TFrom *
-                                // NB: this callback works only with the tabbed forms!
-        """
-
-        ui_get_current_tform = ctypes.c_int(75)
-
-        # workaround for IDA linux binary compiled by GCC
-        # callui return value is returned through an implicit extra argument
-        if sys.platform == "linux2":
-            return_value = ctypes.c_int(0)
-            func_ptr_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int)
-            get_current_tform = func_ptr_type(callui.value)
-            get_current_tform(ctypes.byref(return_value), ui_get_current_tform)
-            parent_tform = return_value.value
-        else:
-            func_ptr_type = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
-            get_current_tform = func_ptr_type(callui.value)
-            parent_tform = get_current_tform(ui_get_current_tform)
-
-        print "    curr tform * 0x%x" % parent_tform
-
-        #-------
-
-        """
-        ui_find_tform,      // * find tform with the specified caption  (only gui version)
-                            // Parameters: const char *caption
-                            // Returns: TFrom *
-                            // NB: this callback works only with the tabbed forms!
-        """
-
-        ui_find_tform = ctypes.c_int(74)
-
-        # workaround for IDA linux binary compiled by GCC
-        # callui return value is returned through an implicit extra argument
-        if sys.platform == "linux2":
-            return_value = ctypes.c_int(0)
-            func_ptr_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_char_p)
-            find_tform = func_ptr_type(callui.value)
-            find_tform(ctypes.byref(return_value), ui_find_tform, ctypes.c_char_p("IDA View-A"))
-            parent_tform2 = return_value.value
-        else:
-            func_ptr_type = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p)
-            find_tform = func_ptr_type(callui.value)
-            parent_tform2 = find_tform(ui_find_tform, ctypes.c_char_p("IDA View-A"))
-
-        print "    find tform * 0x%x (IDA View-A)" % parent_tform2
-
-        #-------
-
-        """
-        inline graph_viewer_t *idaapi get_graph_viewer(TForm *parent)
-            { graph_viewer_t *gv = NULL; grentry(grcode_get_graph_viewer, parent, &gv); return gv; }
-        """
-
-        grcode_get_graph_viewer = ctypes.c_int(0x100 + 1)
-        func_ptr_type_1 = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-        get_graph_viewer = func_ptr_type_1(grentry.value)
-
-        self.gv2 = ctypes.c_void_p()
-        ret = get_graph_viewer(grcode_get_graph_viewer, parent_tform2, ctypes.byref(self.gv2))
-        print "    graph viewer 0x%x ret 0x%x" % (self.gv2.value, ret)
-
-        #---------
-
-        """
-        inline int  idaapi viewer_get_curnode(graph_viewer_t *gv)
-            { return grentry(grcode_get_curnode, gv); }
-        """
-
-        func_ptr_type_7 = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
-        self.get_curnode = func_ptr_type_7(grentry.value)
-
-        """
-        inline void idaapi viewer_center_on(graph_viewer_t *gv, int node)
-            {        grentry(grcode_center_on, gv, node); }
-        """
-
-        func_ptr_type_8 = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
-        self.center_on = func_ptr_type_8(grentry.value)
-        self.grcode_center_on = ctypes.c_int(0x100 + 8)
-        self.grcode_get_curnode = ctypes.c_int(0x100 + 7)
         self.prev_node = None
+        self.graph_viewer = ida_kernwin.get_current_viewer()
 
     def center(self):
-        curnode = self.get_curnode(self.grcode_get_curnode, self.gv2)
+        curnode = ida_graph.viewer_get_curnode(self.graph_viewer)
 
         if not (self.prev_node == curnode):
-            self.center_on(self.grcode_center_on, self.gv2, curnode)
+            ida_graph.viewer_center_on(self.graph_viewer, curnode)
             self.prev_node = curnode
 
         return curnode
@@ -1007,7 +977,7 @@ class SyncForm_t(PluginForm):
             self.init_single_hotkey("Ctrl-F3", self.broker.worker.hbp_oneshot_notice)
             self.init_single_hotkey("Ctrl-F1", self.broker.worker.export_bp_notice)
             self.init_single_hotkey("Alt-F2", self.broker.worker.translate_notice)
-            self.init_single_hotkey("F5", self.broker.worker.go_notice)
+            self.init_single_hotkey("Alt-F5", self.broker.worker.go_notice)
             self.init_single_hotkey("F10", self.broker.worker.so_notice)
             self.init_single_hotkey("F11", self.broker.worker.si_notice)
 
@@ -1061,10 +1031,12 @@ class SyncForm_t(PluginForm):
         # Create label
         label = QtWidgets.QLabel('Overwrite idb name:')
 
-        # Check in conf for name overwrite
         name = idaapi.get_root_filename()
+        print "[sync] default idb name: %s" % name
+        # Check in conf for name overwrite
         confpath = os.path.join(os.path.realpath(IDB_PATH), '.sync')
         if os.path.exists(confpath):
+            print "[sync] found config file: %s" % confpath
             config = ConfigParser.SafeConfigParser()
             config.read(confpath)
             if config.has_option(name, 'name'):
